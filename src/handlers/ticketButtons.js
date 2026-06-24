@@ -1,4 +1,4 @@
-import { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder, AttachmentBuilder, MessageFlags } from 'discord.js';
+import { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder, AttachmentBuilder, MessageFlags, ChannelType, ButtonBuilder, ButtonStyle, PermissionFlagsBits } from 'discord.js';
 import { createEmbed, successEmbed } from '../utils/embeds.js';
 import { createTicket, closeTicket, claimTicket, updateTicketPriority } from '../services/ticket.js';
 import { getGuildConfig } from '../services/guildConfig.js';
@@ -8,6 +8,8 @@ import { InteractionHelper } from '../utils/interactionHelper.js';
 import { checkRateLimit } from '../utils/rateLimiter.js';
 import { replyUserError, ErrorTypes } from '../utils/errorHandler.js';
 import { getTicketPermissionContext } from '../utils/ticketPermissions.js';
+import { getPanel, incrementButtonCounter } from '../utils/panels.js';
+import { saveTicketData } from '../utils/database.js';
 
 function escapeHtml(text) {
   if (!text) return '';
@@ -97,12 +99,175 @@ async function ensureTicketPermission(interaction, client, actionLabel, options 
   return context;
 }
 
+function formatNamingTemplate(template, { slug, counter }) {
+  if (!template) template = '{slug}-{counter}';
+  // replace {slug}
+  let out = template.replace(/\{slug\}/g, slug);
+  // replace {counter} and {counter:03} style
+  out = out.replace(/\{counter(?::0?(\d+))?\}/g, (_, pad) => {
+    const s = String(counter ?? 0);
+    if (pad) return s.padStart(Number(pad), '0');
+    return s;
+  });
+  // sanitize: allow letters, numbers, hyphen, underscore
+  out = out.replace(/[^a-zA-Z0-9-_]/g, '-').toLowerCase();
+  // trim leading/trailing hyphens
+  out = out.replace(/(^-+|-+$)/g, '');
+  return out;
+}
+
 const createTicketHandler = {
   name: 'create_ticket',
-  async execute(interaction, client) {
+  // accept args so panel buttons (create_ticket:panelId:buttonId) can pass their ids
+  async execute(interaction, client, args) {
     try {
       if (!(await ensureGuildContext(interaction))) return;
 
+      // If args are provided, assume this is a panel button press: [panelId, buttonId]
+      if (Array.isArray(args) && args.length >= 2 && args[0] && args[1]) {
+        const panelId = args[0];
+        const buttonId = args[1];
+
+        // rate limit per user for panel press
+        const rateLimitKey = `${interaction.user.id}:panel_create`;
+        const allowed = await checkRateLimit(rateLimitKey, 6, 30000);
+        if (!allowed) {
+          await replyUserError(interaction, { type: ErrorTypes.RATE_LIMIT, message: 'You are creating tickets too quickly. Please wait a moment and try again.' });
+          return;
+        }
+
+        // fetch panel/button configuration
+        const panel = await getPanel(client, interaction.guildId, panelId);
+        if (!panel) {
+          await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: 'Panel configuration not found.' });
+          return;
+        }
+        const button = panel.buttons.find(b => b.id === buttonId);
+        if (!button) {
+          await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: 'Button configuration not found.' });
+          return;
+        }
+
+        // Check per-user ticket limit
+        const config = await getGuildConfig(client, interaction.guildId);
+        const maxTicketsPerUser = config.maxTicketsPerUser || 3;
+        const { getUserTicketCount } = await import('../services/ticket.js');
+        const currentTicketCount = await getUserTicketCount(interaction.guildId, interaction.user.id);
+        if (currentTicketCount >= maxTicketsPerUser) {
+          await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: `You have reached the maximum number of open tickets (${maxTicketsPerUser}). Please close existing tickets before creating a new one.` });
+          return;
+        }
+
+        // Defer reply so we have time
+        const deferSuccess = await InteractionHelper.safeDefer(interaction, { flags: MessageFlags.Ephemeral });
+        if (!deferSuccess) return;
+
+        // increment per-button counter
+        let counterValue;
+        try {
+          counterValue = await incrementButtonCounter(client, interaction.guildId, panelId, buttonId);
+        } catch (err) {
+          logger.error('Failed to increment button counter', err);
+          await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: 'Failed to create ticket (counter). Please try again.' });
+          return;
+        }
+
+        // format channel name
+        const slug = button.slug || (button.label || 'ticket').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        const channelName = formatNamingTemplate(button.namingTemplate || '{slug}-{counter}', { slug, counter: counterValue });
+
+        // determine category to create under
+        const guildConfig = await getGuildConfig(client, interaction.guildId);
+        const categoryId = button.categoryId || panel.categoryId || guildConfig.ticketCategoryId || null;
+
+        // create channel
+        let channel;
+        try {
+          channel = await interaction.guild.channels.create({
+            name: channelName,
+            type: ChannelType.GuildText,
+            parent: categoryId || undefined,
+            permissionOverwrites: [
+              { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+              { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] },
+              ...(button.staffRoleIds && button.staffRoleIds.length ? button.staffRoleIds.map(rid => ({ id: rid, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] })) : (guildConfig.ticketStaffRoleId ? [{ id: guildConfig.ticketStaffRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles] }] : []))
+            ],
+          });
+        } catch (err) {
+          logger.error('Failed to create ticket channel', err);
+          await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: `Failed to create ticket channel: ${err.message}` });
+          return;
+        }
+
+        // prepare and save ticket data
+        const ticketData = {
+          id: channel.id,
+          userId: interaction.user.id,
+          guildId: interaction.guildId,
+          createdAt: new Date().toISOString(),
+          status: 'open',
+          claimedBy: null,
+          priority: 'none',
+          reason: `Opened via panel ${panel.name} / ${button.label}`,
+          panelId,
+          buttonId,
+          buttonCounter: counterValue,
+        };
+
+        try {
+          await saveTicketData(interaction.guildId, channel.id, ticketData);
+        } catch (err) {
+          logger.error('Failed to save ticket data', err);
+        }
+
+        // send initial ticket message
+        try {
+          const embed = createEmbed({
+            title: `Ticket ${channelName}`,
+            description: `${interaction.user.toString()}, thank you — a staff member will be with you shortly.\n\n**Opened via:** ${button.label}`,
+            color: 0x2ecc71,
+            fields: [
+              { name: 'Status', value: '🟢 Open', inline: true },
+              { name: 'Claimed By', value: 'Not claimed', inline: true },
+              { name: 'Created', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true },
+            ]
+          });
+
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('ticket_claim').setLabel('Claim').setStyle(ButtonStyle.Primary).setEmoji('🙋'),
+            new ButtonBuilder().setCustomId('ticket_pin').setLabel('Pin').setStyle(ButtonStyle.Secondary).setEmoji('📌'),
+            new ButtonBuilder().setCustomId('ticket_close').setLabel('Close').setStyle(ButtonStyle.Danger).setEmoji('🔒')
+          );
+
+          const ticketMessage = await channel.send({ content: `${interaction.user}`, embeds: [embed], components: [row] });
+          await ticketMessage.pin().catch(() => {});
+        } catch (err) {
+          logger.error('Failed to send initial ticket message', err);
+        }
+
+        // log event
+        try {
+          await logTicketEvent({
+            client: interaction.client,
+            guildId: interaction.guildId,
+            event: {
+              type: 'open',
+              ticketId: channel.id,
+              ticketNumber: channelName,
+              userId: interaction.user.id,
+              executorId: interaction.user.id,
+              metadata: { panelId, buttonId, buttonCounter: counterValue }
+            }
+          });
+        } catch (err) {
+          logger.warn('Failed to log ticket open event', err.message || err);
+        }
+
+        await interaction.editReply({ content: `Ticket created: ${channel}`, ephemeral: true });
+        return;
+      }
+
+      // FALLBACK: if no args, show modal to create ticket (existing behavior)
       const rateLimitKey = `${interaction.user.id}:create_ticket`;
       const allowed = await checkRateLimit(rateLimitKey, 3, 60000);
       if (!allowed) {
@@ -112,14 +277,14 @@ const createTicketHandler = {
 
       const config = await getGuildConfig(client, interaction.guildId);
       const maxTicketsPerUser = config.maxTicketsPerUser || 3;
-      
+
       const { getUserTicketCount } = await import('../services/ticket.js');
       const currentTicketCount = await getUserTicketCount(interaction.guildId, interaction.user.id);
-      
+
       if (currentTicketCount >= maxTicketsPerUser) {
-        return await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: `You have reached the maximum number of open tickets (${maxTicketsPerUser}).\n\nPlease close your existing ti...` });
+        return await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: `You have reached the maximum number of open tickets (${maxTicketsPerUser}).\n\nPlease close your existing tickets before creating a new one.` });
       }
-      
+
       const modal = new ModalBuilder()
         .setCustomId('create_ticket_modal')
         .setTitle('Create a Ticket');
@@ -181,6 +346,8 @@ const createTicketModalHandler = {
     }
   }
 };
+
+// ... rest of file unchanged (close, claim, priority, pin, unclaim, reopen, delete handlers)
 
 const closeTicketHandler = {
   name: 'ticket_close',
@@ -386,7 +553,7 @@ const pinTicketHandler = {
 
       const deferSuccess = await InteractionHelper.safeDefer(interaction, { flags: MessageFlags.Ephemeral });
       if (!deferSuccess) return;
-
+      
       const channel = interaction.channel;
       const category = channel.parent;
 
