@@ -93,7 +93,7 @@ export async function getButton(client, guildId, panelId, buttonId) {
 
 export function makeButtonCustomId(panelId, buttonId) {
   // Use colon-separated format so the interaction loader splits it into args
-  return `ticket_create:${panelId}:${buttonId}`;
+  return `create_ticket:${panelId}:${buttonId}`;
 }
 
 export async function incrementButtonCounter(client, guildId, panelId, buttonId) {
