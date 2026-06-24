@@ -75,6 +75,19 @@ export default {
       .addStringOption(opt => opt.setName('emoji').setDescription('Emoji for the button (optional)').setRequired(false))
       .addStringOption(opt => opt.setName('style').setDescription('Button style: Primary, Secondary, Success, Danger').setRequired(false))
     )
+    // alias subcommand 'ad' to match shorthand requested by admins
+    .addSubcommand(sc => sc
+      .setName('ad')
+      .setDescription('Alias for add (admin shorthand)')
+      .addStringOption(opt => opt.setName('panel_id').setDescription('ID of the panel (optional if only one panel)').setRequired(false))
+      .addStringOption(opt => opt.setName('name').setDescription('Button label').setRequired(true))
+      .addStringOption(opt => opt.setName('naming_template').setDescription('Naming template {slug}-{counter:03}').setRequired(false))
+      .addChannelOption(opt => opt.setName('category').setDescription('Category for new tickets').setRequired(false))
+      .addStringOption(opt => opt.setName('staff_roles').setDescription('Comma-separated role mentions or IDs').setRequired(false))
+      .addChannelOption(opt => opt.setName('log_channel').setDescription('Log channel for this button').setRequired(false))
+      .addStringOption(opt => opt.setName('emoji').setDescription('Emoji for the button (optional)').setRequired(false))
+      .addStringOption(opt => opt.setName('style').setDescription('Button style: Primary, Secondary, Success, Danger').setRequired(false))
+    )
     .addSubcommand(sc => sc
       .setName('edit')
       .setDescription('Edit a button')
@@ -116,7 +129,9 @@ export default {
         return;
       }
 
-      const sub = interaction.options.getSubcommand();
+      let sub = interaction.options.getSubcommand();
+      // normalize alias
+      if (sub === 'ad') sub = 'add';
 
       if (sub === 'add') {
         let panelId = interaction.options.getString('panel_id', false);
