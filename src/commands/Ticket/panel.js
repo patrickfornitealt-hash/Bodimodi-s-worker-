@@ -1,5 +1,5 @@
-import { SlashCommandBuilder, PermissionFlagsBits } from 'discord.js';
-import { createPanel, listPanels, addButtonToPanel } from '../../utils/panels.js';
+import { SlashCommandBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { createPanel, listPanels, addButtonToPanel, makeButtonCustomId, updatePanel } from '../../utils/panels.js';
 import { successEmbed } from '../../utils/embeds.js';
 import { replyUserError, ErrorTypes } from '../../utils/errorHandler.js';
 
@@ -50,7 +50,33 @@ export default {
         // Create panel record
         const panel = await createPanel(client, interaction.guildId, { name: title, channelId: channel.id });
 
-        await interaction.reply({ embeds: [successEmbed('Panel Created', `Created panel ${panel.name} (id: ${panel.id}) in ${channel}`)], ephemeral: true });
+        // Create a default button and add to panel
+        const defaultButton = await addButtonToPanel(client, interaction.guildId, panel.id, {
+          label: 'Create Ticket',
+          namingTemplate: '{slug}-{counter:03}',
+        });
+
+        const buttonRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(makeButtonCustomId(panel.id, defaultButton.id))
+            .setLabel(defaultButton.label)
+            .setStyle(ButtonStyle.Primary)
+        );
+
+        // Post panel message in the configured channel
+        let postedMessage = null;
+        try {
+          postedMessage = await channel.send({ embeds: [successEmbed(panel.name, 'Press a button below to create a ticket.')], components: [buttonRow] });
+        } catch (sendError) {
+          // If we couldn't post the message, remove the created button and return error
+          await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: `Could not post panel message in <#${channel.id}>: ${sendError.message}` });
+          return;
+        }
+
+        // Save messageId into panel
+        await updatePanel(client, interaction.guildId, panel.id, { messageId: postedMessage.id });
+
+        await interaction.reply({ embeds: [successEmbed('Panel Created', `Created panel ${panel.name} (id: ${panel.id}) in ${channel}.`)], ephemeral: true });
         return;
       }
 
@@ -85,8 +111,35 @@ export default {
           logChannelId: logChannel?.id || null,
         });
 
-        await interaction.reply({ embeds: [successEmbed('Button Added', `Button ${button.label} added to panel (id: ${panelId}).
-CustomId: ${button.id}`)], ephemeral: true });
+        // If panel has a posted message, edit it to add the new button
+        try {
+          const panel = await (await import('../../utils/panels.js')).getPanel(client, interaction.guildId, panelId);
+          if (panel && panel.messageId && panel.channelId) {
+            const ch = await client.channels.fetch(panel.channelId).catch(() => null);
+            if (ch) {
+              const msg = await ch.messages.fetch(panel.messageId).catch(() => null);
+              if (msg) {
+                // Rebuild rows: take existing buttons and append
+                const rows = [];
+                const row = new ActionRowBuilder();
+                for (const b of panel.buttons) {
+                  row.addComponents(
+                    new ButtonBuilder()
+                      .setCustomId(makeButtonCustomId(panel.id, b.id))
+                      .setLabel(b.label)
+                      .setStyle(ButtonStyle.Primary)
+                  );
+                }
+                rows.push(row);
+                await msg.edit({ components: rows });
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('Failed to update panel message with new button:', e.message);
+        }
+
+        await interaction.reply({ embeds: [successEmbed('Button Added', `Button ${button.label} added to panel (id: ${panelId}).` )], ephemeral: true });
         return;
       }
 
