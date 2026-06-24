@@ -24,7 +24,7 @@ export const botConfig = {
     activities: [
       {
         // Text users will see (example: "Playing /help | Titan Bot").
-        name: "Made with ❤️",
+        name: "Woring for Bodimodi",
         // Activity type number (0 = Playing).
         type: 0,
       },
@@ -139,7 +139,7 @@ export const botConfig = {
     },
     footer: {
       // Default footer text used in bot embeds.
-      text: "Titan Bot",
+      text: "Bodimodi's worker",
       // Footer icon URL (null = no icon).
       icon: null,
     },
