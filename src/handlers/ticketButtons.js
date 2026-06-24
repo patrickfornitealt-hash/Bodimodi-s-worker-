@@ -223,7 +223,8 @@ const createTicketHandler = {
         // send initial ticket message
         try {
           const embed = createEmbed({
-            title: `Ticket ${channelName}`,
+-            title: `Ticket ${channelName}`,
++            title: `${button.label}`,
             description: `${interaction.user.toString()}, thank you — a staff member will be with you shortly.\n\n**Opened via:** ${button.label}`,
             color: 0x2ecc71,
             fields: [
